@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
-use std::process::exit;
+use kvs::{KvStore, KvsError, Result};
+use serde::de::value;
+use std::{env::current_dir, process::exit};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -38,21 +40,43 @@ struct RmArgs {
     key: String,
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Get(_) => {
-            eprintln!("unimplemented");
-            exit(1);
+        Commands::Get(get_args) => {
+            let mut kv_store = KvStore::open(current_dir()?)?;
+            match kv_store.get(get_args.key) {
+                Ok(value) => match value {
+                    Some(value) => println!("{}", value),
+                    None => println!("Key not found"),
+                },
+                Err(e) => {
+                    println!("{}", e)
+                }
+            }
+            Ok(())
         }
-        Commands::Rm(_) => {
-            eprintln!("unimplemented");
-            exit(1);
+        Commands::Rm(rm_args) => {
+            let mut kv_store = KvStore::open(current_dir()?)?;
+            match kv_store.remove(rm_args.key){
+                Ok(()) => {Ok(())},
+                Err(e) => {
+                    match e {
+                        KvsError::KeyNotFound => {
+                            println!("Key not found")
+                        }
+                        _ => {}
+                    }
+                    Err(e)
+                }
+            }
+            
         }
-        Commands::Set(_) => {
-            eprintln!("unimplemented");
-            exit(1);
+        Commands::Set(set_args) => {
+            let mut kv_store = KvStore::open(current_dir()?)?;
+            kv_store.set(set_args.key, set_args.value)?;
+            Ok(())
         }
     }
 }
