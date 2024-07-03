@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::DataCommand;
 use crate::KvsError;
 
-const LOG_FILE_SIZE: u64 = 0x1_000_000; //每个日志文件的大小不超过16M
+const MAX_USELESS_SIZE: u64 = 0x10_000; //最大无用大小
 
 /// 带有当前写入位置终点的BufWriter
 pub struct BufWriterWithPos<W: Write + Seek> {
@@ -35,7 +35,7 @@ impl<W: Write + Seek> BufWriterWithPos<W> {
     pub fn write_command(&mut self, command: DataCommand) -> Result<(u64, u64)> {
         let result = serde_json::to_vec(&command)?;
         let prev_pos = self.pos;
-        self.writer.write_all(result.as_slice());
+        self.writer.write_all(result.as_slice())?;
         let length = self
             .writer
             .seek(SeekFrom::Current(0))
@@ -50,16 +50,20 @@ impl<W: Write + Seek> BufWriterWithPos<W> {
 
 /// The `KvStore` stores string key/value pairs.
 ///
-/// Key/value pairs are stored in a `HashMap` in memory and not persisted to disk.
-///
-/// Example:
+/// Key/value pairs are persisted to disk in log files. Log files are named after
+/// monotonically increasing generation numbers with a `log` extension name.
+/// A `BTreeMap` in memory stores the keys and the value locations for fast query.
 ///
 /// ```rust
-/// # use kvs::KvStore;
-/// let mut store = KvStore::new();
-/// store.set("key".to_owned(), "value".to_owned());
-/// let val = store.get("key".to_owned());
+/// # use kvs::{KvStore, Result};
+/// # fn try_main() -> Result<()> {
+/// use std::env::current_dir;
+/// let mut store = KvStore::open(current_dir()?)?;
+/// store.set("key".to_owned(), "value".to_owned())?;
+/// let val = store.get("key".to_owned())?;
 /// assert_eq!(val, Some("value".to_owned()));
+/// # Ok(())
+/// # }
 /// ```
 pub struct KvStore {
     key_dir: HashMap<String, CommandPos>,     // 内存中的哈希表
@@ -74,9 +78,7 @@ impl KvStore {
         mut path_buf: PathBuf,
         log_file_list: &mut Vec<u64>,
     ) -> Result<BufWriterWithPos<File>> {
-        if log_file_list.len() == 0 {
-            log_file_list.push(1);
-        } 
+        log_file_list.push(log_file_list.len() as u64);
         path_buf.push(format!("{}.log", log_file_list[log_file_list.len() - 1]));
         let file = OpenOptions::new()
             .append(true)
@@ -107,7 +109,7 @@ impl KvStore {
     }
 
     // 读取日志文件，并修改kvstore状态，同时返回其中无用字节数量
-    fn read_log_file(
+    fn read_log_files(
         key_dir: &mut HashMap<String, CommandPos>,
         readers: &mut HashMap<u64, BufReader<File>>,
         mut path_buf: PathBuf,
@@ -143,6 +145,36 @@ impl KvStore {
         return Ok(useless_size)
     }
 
+    fn compact(&mut self,mut new_writer:BufWriterWithPos<File>) -> Result<()>{
+        // 将现有数据全部写入到新的日志文件中
+        for (key,cmd_pos) in self.key_dir.iter_mut() {
+            let reader = self.readers.get_mut(&cmd_pos.file_id).expect("Cannot find log reader");
+            reader.seek(SeekFrom::Start(cmd_pos.value_pos))?;
+            if let DataCommand::Set {  value,.. } = serde_json::from_reader(reader.take(cmd_pos.value_size))?{
+                let (value_pos,value_size) = new_writer.write_command(DataCommand::Set { key: key.to_owned(), value: value })?;
+                cmd_pos.change(new_writer.file_id,value_size,value_pos); //写完后要更新命令位置
+            }
+        }
+        self.writer = new_writer;
+        // 将旧文件删除
+        for (old_file_id,_) in &self.readers {
+            let mut path_buf = self.data_dir.clone();
+            path_buf.push(format!("{}.log", old_file_id));
+            fs::remove_file(path_buf)?;
+        }
+        // 重新创建readers
+        let mut new_readers = HashMap::new();
+        let mut path_buf = self.data_dir.clone();
+        path_buf.push(format!("{}.log", self.writer.file_id));
+        let file = OpenOptions::new().read(true).open(path_buf)?;
+        let buf_reader = BufReader::new(file);
+        new_readers.insert(self.writer.file_id, buf_reader);
+        self.readers = new_readers;
+        // useless_size数据现在为0
+        self.useless_size = 0;
+        Ok(())
+    }
+
     /// Opens a `KvStore` with the given path.
     ///
     /// This will create a new directory if the given one does not exist.
@@ -164,7 +196,7 @@ impl KvStore {
 
         let mut useless_size = 0; //无用的数据量大小
         for &file_id in log_file_list.iter() {
-            useless_size += Self::read_log_file(&mut key_dir, &mut readers, data_dir.to_owned(), file_id)?;
+            useless_size += Self::read_log_files(&mut key_dir, &mut readers, data_dir.to_owned(), file_id)?;
         }
         
         Ok(Self {
@@ -180,9 +212,19 @@ impl KvStore {
     ///
     /// If the key already exists, the previous value will be overwritten.
     pub fn set(&mut self, key: String, value: String) -> Result<()>{
+        if self.useless_size > MAX_USELESS_SIZE {
+            // 首先获取一个新的writer
+            let mut log_file_list = Self::sorted_log_list(&self.data_dir);
+            let new_writer = Self::get_writer(self.data_dir.clone(), &mut log_file_list)?;
+            // 将现有的数据全部写到新文件中,并且清除旧数据
+            self.compact(new_writer)?;
+        }
         let (value_pos,value_size) = self.writer.write_command(DataCommand::Set { key: key.clone(), value: value })?;
         self.key_dir.entry(key)
-            .and_modify(|x| {x.change(self.writer.file_id,value_size,value_pos);})
+            .and_modify(|x| {
+                self.useless_size += x.value_size; // 增长无用字节数量
+                x.change(self.writer.file_id,value_size,value_pos);
+            })
             .or_insert(CommandPos{file_id:self.writer.file_id,value_size:value_size,value_pos:value_pos});
         Ok(())
     }
@@ -211,8 +253,9 @@ impl KvStore {
 
     /// Remove a given key.
     pub fn remove(&mut self, key: String) -> Result<()> {
-        if let Some(_) = self.key_dir.get(&key) { //存在才需要删除，否则不删除
+        if let Some(cmd_pos) = self.key_dir.get(&key) { //存在才需要删除，否则不删除
             let (_,_) = self.writer.write_command(DataCommand::Rm { key: key.clone()})?;
+            self.useless_size += cmd_pos.value_size;
             self.key_dir.remove(&key);
             Ok(())
         }else{
